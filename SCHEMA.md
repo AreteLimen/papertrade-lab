@@ -1,0 +1,49 @@
+# SCHEMA — контракт журнала (единственный источник правды по формату)
+
+Сошёлся praxis (симулятор) + Arête (аудит), 2026-07-18. Меняется только через decision record.
+
+Формат: **JSONL, одна строка = одно неизменяемое событие.** Деньги/объём — целые в минимальных
+единицах ЛИБО decimal-строки. **Никаких float.**
+
+## Общий конверт
+    schema_version, run_id, seq, event_id, event_type,
+    event_time_ns      # логическое время симулятора
+    received_ts_ns     # граница знания рынка (когда МЫ получили)  -- разведены нарочно
+    recorded_at_ns     # когда строка записана (детерминирован при replay)
+    caused_by[]        # event_id причин; только назад по event_time_ns
+    prev_hash, payload, event_hash  # hash канонического события без event_hash
+
+## События
+    market_quote: symbol, exchange_ts_ns, received_ts_ns, bid_price, bid_qty,
+                  ask_price, ask_qty, source, raw_payload_hash
+    decision:     strategy_id, strategy_version, decision_time_ns,
+                  observed_through_received_ts_ns,   # граница видимого рынка (по RECEIVED, не exchange)
+                  input_head_hash,                   # hash последнего события видимого среза
+                  action, requested_qty, config_hash, code_hash, rng_seed
+    order_submitted: order_id, decision_id, side, order_type, requested_qty,
+                     limit_price?, submitted_ts_ns
+    order_rejected:  order_id, reason_code, reason_detail, balance_before, position_before
+    fill:         fill_id, order_id, quote_event_id, side, filled_qty,
+                  book_price, slippage_amount, execution_price, available_qty,
+                  fee, cash_delta, position_delta
+    account_state (полностью производное): triggered_by, cash_before/after,
+                  position_before/after, avg_entry_price, realized_pnl, unrealized_pnl,
+                  equity, state_before_hash, state_after_hash
+    run_started:  initial_cash, initial_position, fee_model, slippage_model,
+                  stale_after_ns, config_hash, code_hash
+    run_finished: final_state_hash, event_count, journal_head_hash
+
+## Инварианты (проверяет независимый аудитор)
+1. **Нет look-ahead.** Решение — чистая функция (события с received_ts_ns <= decision_time_ns,
+   config, code, rng_seed). Симулятор подаёт стратегии ТОЛЬКО этот срез. Replay сверяет action И
+   input_head_hash — точный вход, не только выход.
+2. **Fill только после подачи и по первой подходящей котировке.** fill.quote.received_ts_ns >=
+   order_submitted.submitted_ts_ns; для рыночной — ПЕРВАЯ подходящая, не выбранная позже выгодная.
+3. **Исполнение невыгоднее рынка.** buy по ask, sell по bid; знаку slippage не доверяем — аудитор
+   сам проверяет execution_price невыгоднее book_price; fee >= 0.
+4. **Нет бесконечной ликвидности.** filled_qty <= available_qty вершины стакана; нехватка -> частичный
+   fill, остаток открыт либо отменён отдельным событием.
+5. **Append-only.** prev_hash/event_hash — цепочка; правка прошлого её рвёт. seq строго растёт без дыр.
+6. **account_state — результат, не истина.** Аудитор пересчитывает его независимо из fill/rejection.
+7. **Детерминизм replay.** run_started + market_quote + decision -> побитово те же события (recorded_at_ns
+   тоже детерминирован) -> одна хэш-цепочка на прогон -> тот же PnL до копейки.
