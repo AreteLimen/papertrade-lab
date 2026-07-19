@@ -19,7 +19,8 @@
                   ask_price, ask_qty, source, raw_payload_hash
     decision:     strategy_id, strategy_version, decision_time_ns,
                   observed_through_received_ts_ns,   # граница видимого рынка (по RECEIVED, не exchange)
-                  input_head_hash,                   # hash последнего события видимого среза
+                  input_head_hash,                   # СЫРОЙ §5 event_hash видимого среза (для §1/§5, внутрипрогонный)
+                  normalized_input_head_hash,        # normalized_replay_hash того же среза (для §7 между прогонами; DR-004)
                   action, requested_qty, config_hash, code_hash, rng_seed
     order_submitted: order_id, decision_id, side, order_type, requested_qty,
                      limit_price?, submitted_ts_ns
@@ -39,7 +40,8 @@
                   canonicalization_version, ordering_rule, dedup_rule
                   # UTC+ns фиксированы схемой. Пустой вход: диапазоны=null, event_count=0, хэш от канонич. пустого набора.
                   # exchange_ts-диапазон — информационно; причинная граница и сортировка ВСЕГДА по received_ts_ns.
-    run_finished: final_state_hash, event_count, journal_head_hash
+    run_finished: final_state_hash, event_count, journal_head_hash,
+                  normalized_final_state_hash   # для §7 replay; сырой final_state_hash — §5-целостность (DR-004)
 
 ## Инварианты (проверяет независимый аудитор)
 1. **Нет look-ahead.** Решение — чистая функция (события с received_ts_ns <= decision_time_ns,
