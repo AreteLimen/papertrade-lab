@@ -30,16 +30,21 @@ INV_4 = "SS4 no infinite liquidity"
 INV_5 = "SS5 append-only (hash chain / seq)"
 INV_6 = "SS6 account_state is derived"
 INV_7 = "SS7 replay determinism"
+INV_INPUT_ATTACHED = "SS7 input_attached contract (DR-004)"
 
-# SCHEMA.md §7 splits a journal's event types into INPUT (what a strategy is
-# fed: run config + market data + the decision itself) and DERIVED (what the
-# simulator computes FROM that input: orders, fills, ledger state, the run's
-# closing summary). replay_compare() needs this split to tell "you handed me
-# two different experiments" (input differs) apart from "you handed me the
-# same experiment twice and the simulator behaved differently" (derived
-# differs) — only the second one is an actual §7 violation.
-INPUT_EVENT_TYPES = {"run_started", "market_quote", "decision"}
-DERIVED_EVENT_TYPES = {"order_submitted", "order_rejected", "fill", "account_state", "run_finished"}
+# decision-records/DR-004-replay-contract.md supersedes the old INPUT/DERIVED
+# event-type split that used to live here: §7 v1 hardcoded market_quote /
+# decision as "input" and everything downstream as "derived" to decide
+# whether a cross-journal divergence meant "different experiment" or
+# "nondeterminism". v2 replaces that with a narrower, explicit precondition
+# gate (see _replay_preconditions() below) checked ONCE up front from
+# run_started + input_attached: rng_seed, config_hash, code_hash,
+# dataset_hash, schema_version. Once those five agree, replay_compare()
+# treats ANY per-event normalized_replay_hash divergence (market_quote
+# included) as §7 nondeterminism rather than "mismatched input" — see
+# normalized_projection() and replay_compare() for the mechanics, and the
+# report to Evgeniy for why this is an interpretive call DR-004 leaves open.
+NORMALIZATION_VERSION = "1"  # versions the normalized_projection() rule (DR-004 "manifest" section)
 
 
 class AuditViolation(Exception):
@@ -164,6 +169,68 @@ def validate_field_formats(event):
             require_int(payload[field], field, event)
     if etype == "order_submitted" and payload.get("limit_price") is not None:
         require_decimal(payload["limit_price"], "limit_price", event)
+
+
+# ---------------------------------------------------------------------------
+# input_attached structural contract (DR-004 "input_attached — обязательный
+# payload"). Not folded into DECIMAL_PAYLOAD_FIELDS/INT_PAYLOAD_FIELDS above:
+# first_received_ts_ns/last_received_ts_ns are int-OR-null (null iff the
+# input is empty), which the generic tables can't express — they'd reject
+# the legal empty-input case outright.
+# ---------------------------------------------------------------------------
+
+REQUIRED_INPUT_ATTACHED_FIELDS = [
+    "dataset_hash", "dataset_schema_version", "source", "event_count",
+    "first_received_ts_ns", "last_received_ts_ns",
+    "canonicalization_version", "ordering_rule", "dedup_rule",
+]
+
+
+def validate_input_attached(payload, event):
+    """DR-004: every field must be present; event_count is a non-negative
+    int; first/last_received_ts_ns are BOTH int or BOTH null, and null iff
+    event_count == 0 (empty input hashes the canonical empty set)."""
+    for field in REQUIRED_INPUT_ATTACHED_FIELDS:
+        dget(payload, field, event)
+
+    event_count = require_int(payload["event_count"], "event_count", event)
+    if event_count < 0:
+        raise AuditViolation(
+            INV_INPUT_ATTACHED, f"input_attached.event_count={event_count} is negative", **_ctx(event)
+        )
+
+    first_ts = payload["first_received_ts_ns"]
+    last_ts = payload["last_received_ts_ns"]
+    if (first_ts is None) != (last_ts is None):
+        raise AuditViolation(
+            INV_INPUT_ATTACHED,
+            f"input_attached first_received_ts_ns={first_ts!r} / last_received_ts_ns={last_ts!r} "
+            f"must be BOTH null or BOTH set, not mixed",
+            **_ctx(event),
+        )
+    if event_count == 0:
+        if first_ts is not None:
+            raise AuditViolation(
+                INV_INPUT_ATTACHED,
+                f"input_attached.event_count=0 (empty input) but first/last_received_ts_ns are not null",
+                **_ctx(event),
+            )
+    else:
+        if first_ts is None:
+            raise AuditViolation(
+                INV_INPUT_ATTACHED,
+                f"input_attached.event_count={event_count} but first/last_received_ts_ns are null "
+                f"— a non-empty input must carry a real received_ts_ns range",
+                **_ctx(event),
+            )
+        require_int(first_ts, "first_received_ts_ns", event)
+        require_int(last_ts, "last_received_ts_ns", event)
+        if first_ts > last_ts:
+            raise AuditViolation(
+                INV_INPUT_ATTACHED,
+                f"input_attached.first_received_ts_ns={first_ts} > last_received_ts_ns={last_ts}",
+                **_ctx(event),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +442,9 @@ def run_semantic_checks(events, id_index):
             initial_cash = require_decimal(dget(payload, "initial_cash", event), "initial_cash", event)
             initial_position = require_decimal(dget(payload, "initial_position", event), "initial_position", event)
             ledger = Ledger(initial_cash, initial_position)
+
+        elif etype == "input_attached":
+            validate_input_attached(payload, event)
 
         elif etype == "decision":
             observed_through = payload["observed_through_received_ts_ns"]
@@ -646,13 +716,134 @@ def audit(path):
 
 
 # ---------------------------------------------------------------------------
-# SS7: replay determinism, checked as a comparison between TWO journals.
+# DR-004 §7 v2: normalized projection + cross-journal replay comparison +
+# manifest verification.
+#
 # audit() above can only ever say "this one journal is internally honest" —
 # it has no opinion on whether a second run of the same deterministic
-# simulator, fed the same run_started/market_quote/decision input, would
-# reproduce it. That's a cross-journal question, so it gets its own entry
-# point rather than a bolt-on to audit().
+# simulator, fed the same input, would reproduce it. That's a cross-journal
+# question with its own entry points (replay_compare, verify_manifest)
+# rather than a bolt-on to audit().
+#
+# Ground rule (DR-004): two runs of a replay pair have their OWN identity
+# (own run_id, own §5 hash chain) — they are never expected to be bitwise
+# identical (that was §7 v1, retired). What must be identical is the
+# DETERMINISTIC CONTENT of each event: strip instance identifiers + actual
+# wall-clock time + raw §5 integrity-hash pointers (transitively run_id-
+# derived, since they hash a referent's event_hash), keep everything else.
+# normalized_replay_hash() hashes that stripped-down projection;
+# replay_compare()/verify_manifest() work on THIS, never on the raw
+# event_hash / canonical_hash used for §1-6.
 # ---------------------------------------------------------------------------
+
+_ENVELOPE_EXCLUDE_ALWAYS = {"run_id", "prev_hash", "event_hash", "recorded_at_ns"}
+# Raw §5 hash pointers: internal to ONE run's own chain (they hash a
+# referent's event_hash, which itself embeds run_id) — DR-004 "два
+# пространства хэшей". Excluded from the payload side of the projection.
+# Their normalized_* counterparts (normalized_input_head_hash,
+# normalized_final_state_hash) are NOT in this set, so they pass through
+# untouched.
+_PAYLOAD_RAW_HASH_FIELDS = {
+    "journal_head_hash", "state_before_hash", "state_after_hash",
+    "input_head_hash", "final_state_hash",
+}
+_ENVELOPE_PROJECTION_FIELDS = (
+    "seq", "event_time_ns", "received_ts_ns", "event_type", "caused_by",
+    "logical_recorded_at_ns", "schema_version",
+)
+
+
+def normalized_projection(event: dict) -> dict:
+    """DR-004: project one event onto the subset that MUST be identical
+    across two runs of the same deterministic simulator on the same input.
+
+    Excludes (envelope): run_id, prev_hash, event_hash, actual recorded_at_ns.
+    Excludes (payload): raw §5 hash pointers journal_head_hash,
+    state_before_hash, state_after_hash, input_head_hash, final_state_hash —
+    their normalized_* counterparts, if present, are left in untouched.
+    Includes: seq, event_time_ns, received_ts_ns, event_type, caused_by,
+    logical_recorded_at_ns, schema_version, and the rest of payload.
+
+    ASSUMPTION (v0, not spelled out in DR-004 — flagged to praxis): event_id
+    is treated as stable across runs of a replay pair (seq-based, e.g.
+    "evt-001", the way Builder in test_audit.py produces it) — so it is LEFT
+    IN the projection (both this event's own event_id and every reference
+    inside caused_by[]), unlike run_id which is stripped. If a real writer
+    instead scopes event_id to run_id (e.g. prefixes it), every caused_by[]
+    would diverge between two runs of the same replay pair even though
+    nothing is actually nondeterministic — this function would then need to
+    normalize event_id references by POSITION (e.g. seq of the referenced
+    event) instead of comparing them literally. Not implemented: kept simple
+    until praxis confirms which scheme the writer uses.
+    """
+    projection = {field: event.get(field) for field in _ENVELOPE_PROJECTION_FIELDS}
+    projection["event_id"] = event.get("event_id")
+
+    payload = event.get("payload") or {}
+    projection["payload"] = {k: v for k, v in payload.items() if k not in _PAYLOAD_RAW_HASH_FIELDS}
+    return projection
+
+
+def normalized_replay_hash(event: dict) -> str:
+    encoded = json.dumps(
+        normalized_projection(event), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def compute_run_normalized_trace_hash(events: list) -> str:
+    """Single per-run digest summarizing an entire journal's determinism-
+    relevant content: sha256 of the canonical JSON array of each event's
+    normalized_replay_hash, in file order (== seq order, guaranteed gapless
+    and monotonic by SS5). This is what verify_manifest() treats
+    manifest.runs[i].normalized_replay_hash as meaning.
+
+    ASSUMPTION (flagged to praxis): DR-004 says the manifest carries
+    "normalized_replay_hash каждого прогона" but does not define how a
+    single hash summarizes an entire run's per-event trace. This
+    hash-of-per-event-hashes construction is the auditor's choice; a
+    manifest-writer that hashes something else (e.g. only the final event,
+    or a Merkle tree) will legitimately fail verify_manifest()'s check (4)
+    even on a perfectly honest replay pair — praxis MUST use this identical
+    construction, or the two sides need to agree a different one via DR.
+    """
+    per_event_hashes = [normalized_replay_hash(e) for e in events]
+    encoded = json.dumps(per_event_hashes, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _find_event(events, event_type):
+    for e in events:
+        if e["event_type"] == event_type:
+            return e
+    return None
+
+
+def _replay_preconditions(events, label):
+    """DR-004 'Предусловия сравнимости': rng_seed/config_hash/code_hash come
+    from run_started, dataset_hash from input_attached, schema_version from
+    the envelope. Missing either event makes the journal impossible to
+    compare at all — that is itself an INV_7 finding (not a silent None),
+    since claiming a replay pair requires both to exist."""
+    run_started = _find_event(events, "run_started")
+    if run_started is None:
+        raise AuditViolation(INV_7, f"[{label}] journal has no run_started event — cannot establish §7 preconditions")
+    input_attached = _find_event(events, "input_attached")
+    if input_attached is None:
+        raise AuditViolation(
+            INV_7,
+            f"[{label}] journal has no input_attached event — cannot establish dataset_hash precondition (DR-004)",
+        )
+    rs_payload = run_started.get("payload", {})
+    ia_payload = input_attached.get("payload", {})
+    return {
+        "rng_seed": rs_payload.get("rng_seed"),
+        "config_hash": rs_payload.get("config_hash"),
+        "code_hash": rs_payload.get("code_hash"),
+        "dataset_hash": ia_payload.get("dataset_hash"),
+        "schema_version": run_started.get("schema_version"),
+    }
+
 
 def _find_first_diff(a, b, path=""):
     """Walk two JSON-like values in sorted-key order and return the first
@@ -678,36 +869,37 @@ def _find_first_diff(a, b, path=""):
     return None
 
 
-def replay_compare(path_a, path_b, allow_run_id_diff=False):
-    """SCHEMA.md §7: same input (run_started + market_quote + decision) must
-    produce bitwise-identical derived events (order_submitted / order_rejected
-    / fill / account_state / run_finished) — same hash chain, same PnL to the
-    last decimal. This is the only way to actually test that: replay the
-    simulator twice on the same input and diff the two journals.
+def replay_compare(path_a, path_b):
+    """DR-004 §7 v2: two runs of a replay pair (different run_id, common
+    replay_group_id) must produce the same NORMALIZED trace — not bitwise-
+    identical bytes. run_id is baked into canonical_hash, so v1's bitwise
+    comparison made prev_hash/event_hash AND every payload field that embeds
+    another event's canonical_hash (input_head_hash, journal_head_hash,
+    final_state_hash, state_*_hash) diverge legitimately even on a perfectly
+    deterministic simulator. normalized_projection() strips exactly the
+    instance-identifiers + actual wall-clock time + those raw §5 hash
+    pointers; everything else must match. No `--allow-run-id-diff` flag is
+    needed any more — normalization always excludes run_id.
 
     Both journals must first be clean on their own (SS1-6) — comparing two
     broken hash chains for "determinism" is meaningless, so any AuditViolation
-    from the single-journal audit() propagates as-is, unmodified.
+    from the single-journal audit() propagates as-is, labeled by A/B.
 
-    allow_run_id_diff=True relaxes the comparison to ignore run_id and
-    prev_hash (prev_hash of the FIRST event is genesis in both, but every
-    hash after that is derived transitively from run_id via canonical_hash,
-    so a different run_id makes prev_hash diverge everywhere on schedule —
-    that is not evidence of nondeterminism, it's just "two runs got two
-    different run_ids"). Without the flag, comparison is fully bitwise,
-    including run_id/prev_hash/event_hash.
+    Then the DR-004 comparability PRECONDITIONS are checked: rng_seed,
+    config_hash, code_hash, dataset_hash, schema_version must agree (read
+    from run_started + input_attached). If they don't, this is not a replay
+    pair at all — raised as "mismatched-input", explicitly NOT nondeterminism.
 
-    Returns the number of events compared on success (no exception raised).
-    Raises AuditViolation(INV_7, ...) on the first divergence, classified as:
-      - length mismatch (journals end at different points),
-      - mismatched input (an INPUT event differs -> these are two different
-        experiments, not a replay of the same one — §7 does not apply), or
-      - genuine nondeterminism (a DERIVED event differs even though every
-        input up to it matched exactly).
+    Only once preconditions hold does the per-event normalized_replay_hash
+    comparison run. Returns the number of events compared on success (no
+    exception raised). Raises AuditViolation(INV_7, ...) on the first
+    divergence, classified as:
+      - mismatched-input (a precondition field disagrees — two different
+        experiments, §7 does not apply),
+      - length mismatch (journals end at different points), or
+      - genuine nondeterminism (a normalized_replay_hash disagrees even
+        though every precondition matched).
     """
-    # (a) both journals must independently pass SS1-6 first. Label which one
-    # failed: at a replay comparison a bare "SS3 ..." with no filename leaves
-    # you guessing which of the two journals is the dishonest one.
     for _label, _path in (("A", path_a), ("B", path_b)):
         try:
             audit(_path)
@@ -715,44 +907,40 @@ def replay_compare(path_a, path_b, allow_run_id_diff=False):
             _v.message = f"[журнал {_label}: {_path}] {_v.message}"
             raise
 
-    # Re-parse for the raw events themselves -- audit() only returns a count,
-    # and pass-2 semantic checks don't need to keep the parsed list around.
     events_a, _id_index_a, _time_a = load_and_check_chain(path_a)
     events_b, _id_index_b, _time_b = load_and_check_chain(path_b)
 
-    exclude = {"event_hash"}
-    if allow_run_id_diff:
-        exclude |= {"run_id", "prev_hash"}
+    pre_a = _replay_preconditions(events_a, "журнал A")
+    pre_b = _replay_preconditions(events_b, "журнал B")
+    for field in ("rng_seed", "config_hash", "code_hash", "dataset_hash", "schema_version"):
+        if pre_a[field] != pre_b[field]:
+            raise AuditViolation(
+                INV_7,
+                f"mismatched-input: разный {field} (A={pre_a[field]!r} B={pre_b[field]!r}) — "
+                f"это разные эксперименты, а не replay-пара одного входа — сравнение детерминизма "
+                f"неприменимо (mismatched-input, не недетерминизм)",
+            )
 
     n = min(len(events_a), len(events_b))
     for i in range(n):
         event_a, event_b = events_a[i], events_b[i]
-        body_a = {k: v for k, v in event_a.items() if k not in exclude}
-        body_b = {k: v for k, v in event_b.items() if k not in exclude}
-        diff = _find_first_diff(body_a, body_b)
-        if diff is None:
+        hash_a = normalized_replay_hash(event_a)
+        hash_b = normalized_replay_hash(event_b)
+        if hash_a == hash_b:
             continue
 
-        field_path, value_a, value_b = diff
+        diff = _find_first_diff(normalized_projection(event_a), normalized_projection(event_b))
+        field_path, value_a, value_b = diff if diff else ("<root>", "<differs>", "<differs>")
         etype_a = event_a.get("event_type")
-        etype_b = event_b.get("event_type")
         seq_a = event_a.get("seq")
-
-        if etype_a in INPUT_EVENT_TYPES or etype_b in INPUT_EVENT_TYPES:
-            raise AuditViolation(
-                INV_7,
-                f"журналы имеют РАЗНЫЙ вход на seq={seq_a} (event_type={etype_a}/{etype_b}): "
-                f"это разные прогоны, а не replay одного входа — сравнение детерминизма неприменимо "
-                f"(mismatched-input, не недетерминизм); поле '{field_path}' A={value_a!r} B={value_b!r}",
-                seq=seq_a, event_id=event_a.get("event_id"), event_type=etype_a,
-            )
-        else:
-            raise AuditViolation(
-                INV_7,
-                f"одинаковый вход, но производное событие seq={seq_a} (event_type={etype_a}) расходится: "
-                f"поле '{field_path}' A={value_a!r} B={value_b!r} — симулятор недетерминирован",
-                seq=seq_a, event_id=event_a.get("event_id"), event_type=etype_a,
-            )
+        raise AuditViolation(
+            INV_7,
+            f"одинаковый вход (precondition-поля совпали), но производное событие seq={seq_a} "
+            f"(event_type={etype_a}) расходится по нормализованному следу: поле '{field_path}' "
+            f"A={value_a!r} B={value_b!r} (normalized_replay_hash A={hash_a} B={hash_b}) — "
+            f"симулятор недетерминирован",
+            seq=seq_a, event_id=event_a.get("event_id"), event_type=etype_a,
+        )
 
     if len(events_a) != len(events_b):
         longer_label, longer_events = ("A", events_a) if len(events_a) > len(events_b) else ("B", events_b)
@@ -760,34 +948,180 @@ def replay_compare(path_a, path_b, allow_run_id_diff=False):
         raise AuditViolation(
             INV_7,
             f"журналы разной длины: A={len(events_a)} событий, B={len(events_b)} событий; "
-            f"общий префикс совпадает по {n} событиям, дальше журнал {longer_label} продолжается "
-            f"событием seq={extra.get('seq')} event_type={extra.get('event_type')}, а второй журнал "
-            f"на этом месте уже закончился",
+            f"нормализованный префикс совпадает по {n} событиям, дальше журнал {longer_label} "
+            f"продолжается событием seq={extra.get('seq')} event_type={extra.get('event_type')}, "
+            f"а второй журнал на этом месте уже закончился",
             seq=extra.get("seq"), event_id=extra.get("event_id"), event_type=extra.get("event_type"),
         )
 
     return n
 
 
+def verify_manifest(manifest_path, journal_paths):
+    """DR-004 'Manifest — ОТДЕЛЬНЫЙ артефакт, аудитор ОБЯЗАН проверять': the
+    auditor trusts nothing in this file — it independently re-derives every
+    claim from the journals and raises AuditViolation(INV_7, ...) on the
+    first mismatch, naming exactly what disagreed.
+
+    Checks, in order (DR-004 numbering):
+      (1) each journal in journal_paths independently passes audit() (§1-6);
+      (2) manifest.runs[i].journal_head_hash == the journal's actual last
+          event_hash, and .event_count == actual event count;
+      (3) manifest's common dataset_hash/config_hash/code_hash/rng_seed/
+          schema_version actually match what's in each journal's
+          run_started/input_attached (also, transitively, that all journals
+          in the group agree with EACH OTHER, since they all have to match
+          the same manifest-declared value);
+      (4) the auditor independently recomputes each run's normalized trace
+          (compute_run_normalized_trace_hash) and compares it to
+          manifest.runs[i].normalized_replay_hash;
+      (5) manifest.replay_equal == whether the independently recomputed
+          per-run trace hashes are actually all equal.
+
+    ASSUMPTION (flagged to praxis, DR-004 leaves both open):
+      - manifest.runs[i] carries its own `normalized_replay_hash` field
+        (keyed by run_id, inside the same dict as journal_head_hash/
+        event_count) rather than a separate list running parallel to
+        `runs` — avoids positional-correlation bugs if the two lists were
+        ever reordered independently.
+      - journal_paths <-> manifest.runs correlation is by run_id (read from
+        each journal's own events), not by list position/filename.
+
+    Returns a small summary dict on success; raises on the first violation.
+    """
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    journals = {}  # run_id -> (events, path)
+    for jpath in journal_paths:
+        try:
+            audit(jpath)
+        except AuditViolation as v:
+            v.message = f"[journal {jpath}] {v.message}"
+            raise
+        events, _id_index, _time_index = load_and_check_chain(jpath)
+        run_id = events[0].get("run_id")
+        journals[run_id] = (events, jpath)
+
+    manifest_runs = manifest.get("runs") or []
+    if not manifest_runs:
+        raise AuditViolation(INV_7, f"manifest {manifest_path} has no 'runs' entries to verify")
+
+    trace_hashes = []
+    for run_entry in manifest_runs:
+        run_id = run_entry.get("run_id")
+        if run_id not in journals:
+            raise AuditViolation(
+                INV_7,
+                f"manifest references run_id={run_id!r} but no matching journal was given "
+                f"(journals provided for run_id in: {sorted(journals)})",
+            )
+        events, jpath = journals[run_id]
+
+        # (2) journal_head_hash / event_count
+        actual_head = events[-1]["event_hash"]
+        actual_count = len(events)
+        if run_entry.get("journal_head_hash") != actual_head:
+            raise AuditViolation(
+                INV_7,
+                f"manifest.runs[run_id={run_id}].journal_head_hash="
+                f"{run_entry.get('journal_head_hash')!r} != actual last event_hash={actual_head!r} "
+                f"of {jpath}",
+            )
+        if run_entry.get("event_count") != actual_count:
+            raise AuditViolation(
+                INV_7,
+                f"manifest.runs[run_id={run_id}].event_count={run_entry.get('event_count')!r} "
+                f"!= actual event count {actual_count} of {jpath}",
+            )
+
+        # (3) common dataset_hash/config_hash/code_hash/rng_seed/schema_version
+        pre = _replay_preconditions(events, f"run_id={run_id}")
+        for field in ("dataset_hash", "config_hash", "code_hash", "rng_seed", "schema_version"):
+            actual_value = pre[field]
+            manifest_value = manifest.get(field)
+            if manifest_value != actual_value:
+                raise AuditViolation(
+                    INV_7,
+                    f"manifest.{field}={manifest_value!r} != actual {field}={actual_value!r} found "
+                    f"in journal for run_id={run_id} ({jpath})",
+                )
+
+        # (4) independently recomputed per-run normalized trace hash
+        actual_trace_hash = compute_run_normalized_trace_hash(events)
+        trace_hashes.append((run_id, actual_trace_hash))
+        claimed_trace_hash = run_entry.get("normalized_replay_hash")
+        if claimed_trace_hash != actual_trace_hash:
+            raise AuditViolation(
+                INV_7,
+                f"manifest.runs[run_id={run_id}].normalized_replay_hash={claimed_trace_hash!r} "
+                f"!= independently recomputed {actual_trace_hash!r} — manifest misrepresents the "
+                f"replay trace (tampered, stale, or normalization_version mismatch)",
+            )
+
+    # (5) replay_equal must match reality
+    distinct_hashes = {h for _rid, h in trace_hashes}
+    actual_replay_equal = len(distinct_hashes) <= 1
+    claimed_replay_equal = manifest.get("replay_equal")
+    if claimed_replay_equal != actual_replay_equal:
+        raise AuditViolation(
+            INV_7,
+            f"manifest.replay_equal={claimed_replay_equal!r} but independently recomputed "
+            f"normalized traces are {'EQUAL' if actual_replay_equal else 'DIFFERENT'} across runs "
+            f"({trace_hashes}) — manifest misrepresents §7 determinism",
+        )
+
+    return {
+        "replay_group_id": manifest.get("replay_group_id"),
+        "runs_checked": [rid for rid, _h in trace_hashes],
+        "replay_equal": actual_replay_equal,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Independent auditor for papertrade-lab JSONL journals.")
-    parser.add_argument("journal", help="path to the JSONL journal file")
     parser.add_argument(
-        "--replay-compare", metavar="OTHER_JOURNAL", default=None,
-        help="SS7: instead of a single-journal audit, compare `journal` against OTHER_JOURNAL as a "
-             "deterministic-replay pair",
+        "journal", nargs="+",
+        help="path(s) to JSONL journal file(s). Single-journal audit: exactly one path. "
+             "--replay-compare: exactly one path here (the other comes via the flag). "
+             "--replay-manifest: list ALL run journals of the group here — matched to the "
+             "manifest by run_id, order does not matter.",
     )
     parser.add_argument(
-        "--allow-run-id-diff", action="store_true",
-        help="with --replay-compare: ignore run_id/prev_hash differences between the two journals "
-             "(comparing two different run_ids replaying the same input) instead of requiring "
-             "bitwise-identical events",
+        "--replay-compare", metavar="OTHER_JOURNAL", default=None,
+        help="DR-004 §7: instead of a single-journal audit, compare `journal` against OTHER_JOURNAL "
+             "as a normalized-replay pair",
+    )
+    parser.add_argument(
+        "--replay-manifest", metavar="MANIFEST_JSON", default=None,
+        help="DR-004: verify MANIFEST_JSON against the journal(s) given as positional arguments "
+             "(does not trust the manifest — recomputes everything from the journals)",
     )
     args = parser.parse_args()
 
-    if args.replay_compare is not None:
+    if args.replay_manifest is not None:
         try:
-            n = replay_compare(args.journal, args.replay_compare, args.allow_run_id_diff)
+            result = verify_manifest(args.replay_manifest, args.journal)
+        except AuditViolation as v:
+            print(str(v), file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError as e:
+            print(f"AUDIT ERROR: file not found: {e.filename}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"OK: manifest verified, replay_equal={result['replay_equal']}, runs={result['runs_checked']}.")
+        sys.exit(0)
+
+    if args.replay_compare is not None:
+        if len(args.journal) != 1:
+            print(
+                "AUDIT ERROR: --replay-compare takes exactly one positional journal "
+                "(the other journal is given via --replay-compare)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        try:
+            n = replay_compare(args.journal[0], args.replay_compare)
         except AuditViolation as v:
             print(str(v), file=sys.stderr)
             sys.exit(1)
@@ -795,16 +1129,19 @@ def main():
             print(f"AUDIT ERROR: journal not found: {e.filename}", file=sys.stderr)
             sys.exit(1)
 
-        print(f"OK: deterministic replay pair, {n} events match.")
+        print(f"OK: deterministic replay pair (normalized, DR-004), {n} events match.")
         sys.exit(0)
 
+    if len(args.journal) != 1:
+        print("AUDIT ERROR: single-journal audit takes exactly one journal path", file=sys.stderr)
+        sys.exit(2)
     try:
-        n = audit(args.journal)
+        n = audit(args.journal[0])
     except AuditViolation as v:
         print(str(v), file=sys.stderr)
         sys.exit(1)
     except FileNotFoundError:
-        print(f"AUDIT ERROR: journal not found: {args.journal}", file=sys.stderr)
+        print(f"AUDIT ERROR: journal not found: {args.journal[0]}", file=sys.stderr)
         sys.exit(1)
 
     print(f"OK: {n} events, no invariant violations found.")
