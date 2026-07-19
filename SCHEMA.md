@@ -9,7 +9,8 @@
     schema_version, run_id, seq, event_id, event_type,
     event_time_ns      # логическое время симулятора
     received_ts_ns     # граница знания рынка (когда МЫ получили)  -- разведены нарочно
-    recorded_at_ns     # когда строка записана (детерминирован при replay)
+    recorded_at_ns         # ФАКТИЧЕСКОЕ физическое время записи; ВНЕ нормализованного replay-сравнения (§7)
+    logical_recorded_at_ns # детерминированное «когда записалось бы при идеальном replay»; ВХОДИТ в нормализацию (§7)
     caused_by[]        # event_id причин; только назад по event_time_ns
     prev_hash, payload, event_hash  # hash канонического события без event_hash
 
@@ -30,7 +31,14 @@
                   position_before/after, avg_entry_price, realized_pnl, unrealized_pnl,
                   equity, state_before_hash, state_after_hash
     run_started:  initial_cash, initial_position, fee_model, slippage_model,
-                  stale_after_ns, config_hash, code_hash
+                  stale_after_ns, config_hash, code_hash, rng_seed, replay_group_id
+                  # replay_group_id связывает прогоны ОДНОЙ replay-пары (разные run_id); NULL — одиночный прогон
+    input_attached: dataset_hash,            # хэш КАНОНИЗИРОВАННОГО содержимого входа, не файла-контейнера
+                  dataset_schema_version, source,   # source: тип/идентификатор без секретов и локальных путей
+                  event_count, first_received_ts_ns, last_received_ts_ns,
+                  canonicalization_version, ordering_rule, dedup_rule
+                  # UTC+ns фиксированы схемой. Пустой вход: диапазоны=null, event_count=0, хэш от канонич. пустого набора.
+                  # exchange_ts-диапазон — информационно; причинная граница и сортировка ВСЕГДА по received_ts_ns.
     run_finished: final_state_hash, event_count, journal_head_hash
 
 ## Инварианты (проверяет независимый аудитор)
@@ -45,5 +53,11 @@
    fill, остаток открыт либо отменён отдельным событием.
 5. **Append-only.** prev_hash/event_hash — цепочка; правка прошлого её рвёт. seq строго растёт без дыр.
 6. **account_state — результат, не истина.** Аудитор пересчитывает его независимо из fill/rejection.
-7. **Детерминизм replay.** run_started + market_quote + decision -> побитово те же события (recorded_at_ns
-   тоже детерминирован) -> одна хэш-цепочка на прогон -> тот же PnL до копейки.
+7. **Детерминизм replay.** Два прогона ОДНОЙ replay-группы (разные run_id, общий replay_group_id) на том же
+   входе (dataset_hash) при совпадении rng_seed / config_hash / code_hash / schema_version дают тождественный
+   НОРМАЛИЗОВАННЫЙ след. Нормализация ИСКЛЮЧАЕТ идентификаторы экземпляра (run_id, prev_hash, event_hash) и
+   ФАКТИЧЕСКОЕ физическое время (recorded_at_ns); logical_recorded_at_ns и весь детерминированный контент —
+   ВКЛЮЧАЕТ. normalized_replay_hash = хэш нормализованной проекции; два прогона детерминистичны ⟺ их
+   normalized_replay_hash совпадают пособытийно. Это ОТДЕЛЬНО от §5-цепи: event_hash держит целостность ВНУТРИ
+   прогона (включает всё), §7 сравнивает МЕЖДУ прогонами по нормализованной проекции. Формат нормализации,
+   manifest и правила сверки — **DR-004**.
