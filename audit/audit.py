@@ -29,6 +29,17 @@ INV_3 = "SS3 execution worse than market"
 INV_4 = "SS4 no infinite liquidity"
 INV_5 = "SS5 append-only (hash chain / seq)"
 INV_6 = "SS6 account_state is derived"
+INV_7 = "SS7 replay determinism"
+
+# SCHEMA.md §7 splits a journal's event types into INPUT (what a strategy is
+# fed: run config + market data + the decision itself) and DERIVED (what the
+# simulator computes FROM that input: orders, fills, ledger state, the run's
+# closing summary). replay_compare() needs this split to tell "you handed me
+# two different experiments" (input differs) apart from "you handed me the
+# same experiment twice and the simulator behaved differently" (derived
+# differs) — only the second one is an actual §7 violation.
+INPUT_EVENT_TYPES = {"run_started", "market_quote", "decision"}
+DERIVED_EVENT_TYPES = {"order_submitted", "order_rejected", "fill", "account_state", "run_finished"}
 
 
 class AuditViolation(Exception):
@@ -634,10 +645,158 @@ def audit(path):
     return len(events)
 
 
+# ---------------------------------------------------------------------------
+# SS7: replay determinism, checked as a comparison between TWO journals.
+# audit() above can only ever say "this one journal is internally honest" —
+# it has no opinion on whether a second run of the same deterministic
+# simulator, fed the same run_started/market_quote/decision input, would
+# reproduce it. That's a cross-journal question, so it gets its own entry
+# point rather than a bolt-on to audit().
+# ---------------------------------------------------------------------------
+
+def _find_first_diff(a, b, path=""):
+    """Walk two JSON-like values in sorted-key order and return the first
+    (path, value_a, value_b) where they disagree, or None if equal. Recurses
+    into dicts (so a mismatch inside `payload` is reported by its actual
+    field name, e.g. "payload.execution_price", not just "payload") and
+    compares everything else (lists, scalars) by value. Sorted key order
+    makes "the first disagreement" a well-defined, repeatable answer rather
+    than an artifact of dict insertion order."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        for key in sorted(set(a) | set(b)):
+            key_path = f"{path}.{key}" if path else key
+            if key not in a:
+                return (key_path, "<missing>", b[key])
+            if key not in b:
+                return (key_path, a[key], "<missing>")
+            sub = _find_first_diff(a[key], b[key], key_path)
+            if sub is not None:
+                return sub
+        return None
+    if a != b:
+        return (path or "<root>", a, b)
+    return None
+
+
+def replay_compare(path_a, path_b, allow_run_id_diff=False):
+    """SCHEMA.md §7: same input (run_started + market_quote + decision) must
+    produce bitwise-identical derived events (order_submitted / order_rejected
+    / fill / account_state / run_finished) — same hash chain, same PnL to the
+    last decimal. This is the only way to actually test that: replay the
+    simulator twice on the same input and diff the two journals.
+
+    Both journals must first be clean on their own (SS1-6) — comparing two
+    broken hash chains for "determinism" is meaningless, so any AuditViolation
+    from the single-journal audit() propagates as-is, unmodified.
+
+    allow_run_id_diff=True relaxes the comparison to ignore run_id and
+    prev_hash (prev_hash of the FIRST event is genesis in both, but every
+    hash after that is derived transitively from run_id via canonical_hash,
+    so a different run_id makes prev_hash diverge everywhere on schedule —
+    that is not evidence of nondeterminism, it's just "two runs got two
+    different run_ids"). Without the flag, comparison is fully bitwise,
+    including run_id/prev_hash/event_hash.
+
+    Returns the number of events compared on success (no exception raised).
+    Raises AuditViolation(INV_7, ...) on the first divergence, classified as:
+      - length mismatch (journals end at different points),
+      - mismatched input (an INPUT event differs -> these are two different
+        experiments, not a replay of the same one — §7 does not apply), or
+      - genuine nondeterminism (a DERIVED event differs even though every
+        input up to it matched exactly).
+    """
+    # (a) both journals must independently pass SS1-6 first. Label which one
+    # failed: at a replay comparison a bare "SS3 ..." with no filename leaves
+    # you guessing which of the two journals is the dishonest one.
+    for _label, _path in (("A", path_a), ("B", path_b)):
+        try:
+            audit(_path)
+        except AuditViolation as _v:
+            _v.message = f"[журнал {_label}: {_path}] {_v.message}"
+            raise
+
+    # Re-parse for the raw events themselves -- audit() only returns a count,
+    # and pass-2 semantic checks don't need to keep the parsed list around.
+    events_a, _id_index_a, _time_a = load_and_check_chain(path_a)
+    events_b, _id_index_b, _time_b = load_and_check_chain(path_b)
+
+    exclude = {"event_hash"}
+    if allow_run_id_diff:
+        exclude |= {"run_id", "prev_hash"}
+
+    n = min(len(events_a), len(events_b))
+    for i in range(n):
+        event_a, event_b = events_a[i], events_b[i]
+        body_a = {k: v for k, v in event_a.items() if k not in exclude}
+        body_b = {k: v for k, v in event_b.items() if k not in exclude}
+        diff = _find_first_diff(body_a, body_b)
+        if diff is None:
+            continue
+
+        field_path, value_a, value_b = diff
+        etype_a = event_a.get("event_type")
+        etype_b = event_b.get("event_type")
+        seq_a = event_a.get("seq")
+
+        if etype_a in INPUT_EVENT_TYPES or etype_b in INPUT_EVENT_TYPES:
+            raise AuditViolation(
+                INV_7,
+                f"журналы имеют РАЗНЫЙ вход на seq={seq_a} (event_type={etype_a}/{etype_b}): "
+                f"это разные прогоны, а не replay одного входа — сравнение детерминизма неприменимо "
+                f"(mismatched-input, не недетерминизм); поле '{field_path}' A={value_a!r} B={value_b!r}",
+                seq=seq_a, event_id=event_a.get("event_id"), event_type=etype_a,
+            )
+        else:
+            raise AuditViolation(
+                INV_7,
+                f"одинаковый вход, но производное событие seq={seq_a} (event_type={etype_a}) расходится: "
+                f"поле '{field_path}' A={value_a!r} B={value_b!r} — симулятор недетерминирован",
+                seq=seq_a, event_id=event_a.get("event_id"), event_type=etype_a,
+            )
+
+    if len(events_a) != len(events_b):
+        longer_label, longer_events = ("A", events_a) if len(events_a) > len(events_b) else ("B", events_b)
+        extra = longer_events[n]
+        raise AuditViolation(
+            INV_7,
+            f"журналы разной длины: A={len(events_a)} событий, B={len(events_b)} событий; "
+            f"общий префикс совпадает по {n} событиям, дальше журнал {longer_label} продолжается "
+            f"событием seq={extra.get('seq')} event_type={extra.get('event_type')}, а второй журнал "
+            f"на этом месте уже закончился",
+            seq=extra.get("seq"), event_id=extra.get("event_id"), event_type=extra.get("event_type"),
+        )
+
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="Independent auditor for papertrade-lab JSONL journals.")
     parser.add_argument("journal", help="path to the JSONL journal file")
+    parser.add_argument(
+        "--replay-compare", metavar="OTHER_JOURNAL", default=None,
+        help="SS7: instead of a single-journal audit, compare `journal` against OTHER_JOURNAL as a "
+             "deterministic-replay pair",
+    )
+    parser.add_argument(
+        "--allow-run-id-diff", action="store_true",
+        help="with --replay-compare: ignore run_id/prev_hash differences between the two journals "
+             "(comparing two different run_ids replaying the same input) instead of requiring "
+             "bitwise-identical events",
+    )
     args = parser.parse_args()
+
+    if args.replay_compare is not None:
+        try:
+            n = replay_compare(args.journal, args.replay_compare, args.allow_run_id_diff)
+        except AuditViolation as v:
+            print(str(v), file=sys.stderr)
+            sys.exit(1)
+        except FileNotFoundError as e:
+            print(f"AUDIT ERROR: journal not found: {e.filename}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"OK: deterministic replay pair, {n} events match.")
+        sys.exit(0)
 
     try:
         n = audit(args.journal)

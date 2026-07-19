@@ -81,10 +81,19 @@ class Builder:
                 f.write(json.dumps(ev, sort_keys=True) + "\n")
 
 
-def build_scenario(mutation=None) -> Builder:
+def build_scenario(mutation=None, run_id=None, fill_execution_price=None, requested_qty=None) -> Builder:
     """One decision -> one order -> one fill -> one account_state -> run_finished.
-    `mutation` injects exactly one lie; None builds the honest baseline."""
-    b = Builder()
+    `mutation` injects exactly one lie; None builds the honest baseline.
+
+    `run_id`, `fill_execution_price`, `requested_qty` are for the SS7 (replay
+    determinism) tests below, NOT for the SS1-6 dishonesty scenarios above:
+    they let a caller build a second, still fully SS1-6-valid journal that
+    varies exactly one thing (the run's identity, a derived execution price,
+    or an input quantity) so replay_compare() has something clean to compare
+    against. Unlike `mutation`, none of these three make the journal lie
+    about itself — they change what "the honest truth" for this journal is.
+    """
+    b = Builder(run_id=run_id) if run_id is not None else Builder()
     initial_cash = Decimal("10000.00")
     initial_position = Decimal("0")
 
@@ -106,12 +115,14 @@ def build_scenario(mutation=None) -> Builder:
     if mutation == "future_observed_through":
         observed_through = 10_000  # decision claims a market view further in the future than the decision itself
 
+    qty = requested_qty if requested_qty is not None else "0.01"
+
     d1_id = b.add("decision", 150, 150, caused_by=[q1_id], payload={
         "strategy_id": "buy-and-hold-v0", "strategy_version": "1",
         "decision_time_ns": 150,
         "observed_through_received_ts_ns": observed_through,
         "input_head_hash": q1_hash,
-        "action": "buy", "requested_qty": d("0.01"),
+        "action": "buy", "requested_qty": d(qty),
         "config_hash": "cfg-abc123", "code_hash": "code-def456", "rng_seed": 42,
     })
 
@@ -119,7 +130,7 @@ def build_scenario(mutation=None) -> Builder:
     # from the envelope event_id; fill.payload.order_id must reference THIS, not the event_id.
     o1_id = b.add("order_submitted", 200, 200, caused_by=[d1_id], payload={
         "order_id": order_business_id, "decision_id": d1_id, "side": "buy", "order_type": "market",
-        "requested_qty": d("0.01"), "submitted_ts_ns": 200,
+        "requested_qty": d(qty), "submitted_ts_ns": 200,
     })
 
     q2_id = b.add("market_quote", 250, 250, payload={
@@ -142,6 +153,12 @@ def build_scenario(mutation=None) -> Builder:
         filled_qty = Decimal("1.5")  # exceeds top-of-book ask_qty=1.0
     if mutation == "fill_before_submit":
         fill_quote_id = q1_id  # q1.received_ts_ns=100 < order.submitted_ts_ns=200
+    if fill_execution_price is not None:
+        # SS7 nondeterminism fixture: still honest (worse-than-ask, fee/cash/position
+        # all recomputed below from THIS price via the same Ledger the auditor uses) —
+        # just a different honest outcome, standing in for "two runs of the same
+        # deterministic simulator disagreed on the execution price".
+        execution_price = Decimal(fill_execution_price)
 
     book_price = ask_at_fill_quote
     slippage_amount = abs(execution_price - book_price)
@@ -203,6 +220,37 @@ def build_seq_gap() -> Builder:
     return b
 
 
+def build_bare_run(run_id) -> Builder:
+    """Minimal SS1-6-valid journal (run_started + one market_quote only, no
+    decision/fill/run_finished) used ONLY by the SS7 replay_run_id_diff test.
+
+    build_scenario() cannot be reused for that test: its decision event
+    carries input_head_hash = the REAL event_hash of an earlier market_quote,
+    and its run_finished carries journal_head_hash = the REAL event_hash of
+    the preceding account_state. Both are payload fields that embed another
+    event's canonical_hash — which itself hashes over run_id — so both are
+    exactly as run_id-derived as prev_hash is, even though the task's spec
+    for --allow-run-id-diff names only run_id/prev_hash as excludable. A
+    "same content, different run_id" pair built from full build_scenario()
+    therefore still (correctly, per the LITERAL spec implemented here) fails
+    replay_compare even with the flag. This trimmed journal has neither
+    hash-pointer field, so it isolates the run_id/prev_hash exclusion itself
+    without tripping over that open question (flagged in the report)."""
+    b = Builder(run_id=run_id)
+    b.add("run_started", 0, 0, payload={
+        "initial_cash": d("10000.00"), "initial_position": d("0"),
+        "fee_model": "flat", "slippage_model": "worst-of-book",
+        "stale_after_ns": 5_000_000_000, "config_hash": "cfg-abc123", "code_hash": "code-def456",
+    })
+    b.add("market_quote", 100, 100, payload={
+        "symbol": "BTCUSDT", "exchange_ts_ns": 95, "received_ts_ns": 100,
+        "bid_price": d("49990.00"), "bid_qty": d("1.0"),
+        "ask_price": d("50000.00"), "ask_qty": d("1.0"),
+        "source": "synthetic", "raw_payload_hash": "raw-hash-q1",
+    })
+    return b
+
+
 SCENARIOS = {
     "valid": lambda: build_scenario(None),
     "SS3 bad_execution_price (buy filled at/below ask)": lambda: build_scenario("bad_execution_price"),
@@ -253,8 +301,105 @@ def run():
     return results
 
 
+# ---------------------------------------------------------------------------
+# SS7 (replay determinism): a separate proof, because it's a claim about a
+# PAIR of journals, not one journal. Each scenario below builds two journals
+# and runs audit.replay_compare() on the pair, checking not just "violation
+# or not" but that a violation is classified the way SCHEMA.md §7 demands:
+# a differing INPUT event must read as "wrong pair to compare" (mismatched
+# input), never as "the simulator is nondeterministic".
+# ---------------------------------------------------------------------------
+
+def run_replay_tests():
+    tmpdir = Path(tempfile.mkdtemp(prefix="papertrade-audit-replay-test-"))
+    results = []
+
+    def write_pair(name, builder_a, builder_b):
+        path_a = tmpdir / (name + "_a.jsonl")
+        path_b = tmpdir / (name + "_b.jsonl")
+        builder_a.write(path_a)
+        builder_b.write(path_b)
+        return path_a, path_b
+
+    # 1. Identical input AND identical (deterministic) output -> clean OK, no exception.
+    name = "SS7 replay_identical (same input, same output)"
+    path_a, path_b = write_pair("replay_identical", build_scenario(None), build_scenario(None))
+    try:
+        n = audit.replay_compare(str(path_a), str(path_b))
+        ok, outcome, detail = True, "PASS", f"OK, {n} events match"
+    except audit.AuditViolation as v:
+        ok, outcome, detail = False, "FAIL", f"expected OK but got [{v.invariant}]: {v.message}"
+    results.append((name, ok, outcome, detail))
+
+    # 2. Same input, but the DERIVED fill disagrees (50000.50 vs 50000.60, both honest
+    #    worse-than-ask fills individually) -> real §7 violation, pinned to `fill`.
+    name = "SS7 replay_nondeterministic (fill diverges on identical input)"
+    path_a, path_b = write_pair(
+        "replay_nondeterministic",
+        build_scenario(None),
+        build_scenario(None, fill_execution_price="50000.60"),
+    )
+    try:
+        audit.replay_compare(str(path_a), str(path_b))
+        ok, outcome, detail = False, "FAIL", "expected INV_7 violation but replay_compare accepted the pair"
+    except audit.AuditViolation as v:
+        if v.invariant == audit.INV_7 and v.event_type == "fill" and "недетерминирован" in v.message:
+            ok, outcome, detail = True, "PASS", f"caught as [{v.invariant}] on fill: {v.message}"
+        else:
+            ok, outcome, detail = False, "FAIL", f"wrong classification: [{v.invariant}] event_type={v.event_type}: {v.message}"
+    results.append((name, ok, outcome, detail))
+
+    # 3. Different INPUT (decision.requested_qty 0.01 vs 0.02, both individually valid)
+    #    -> must be reported as mismatched-input, NOT nondeterminism.
+    name = "SS7 replay_different_input (requested_qty differs -> not a replay pair)"
+    path_a, path_b = write_pair(
+        "replay_different_input",
+        build_scenario(None),
+        build_scenario(None, requested_qty="0.02"),
+    )
+    try:
+        audit.replay_compare(str(path_a), str(path_b))
+        ok, outcome, detail = False, "FAIL", "expected INV_7 violation but replay_compare accepted the pair"
+    except audit.AuditViolation as v:
+        if v.invariant == audit.INV_7 and "mismatched-input" in v.message:
+            ok, outcome, detail = True, "PASS", f"caught as mismatched-input: {v.message}"
+        else:
+            ok, outcome, detail = False, "FAIL", f"expected mismatched-input classification, got [{v.invariant}]: {v.message}"
+    results.append((name, ok, outcome, detail))
+
+    # 4. Same content, different run_id: a strict compare must reject it (run_id/
+    #    prev_hash diverge on schedule), but --allow-run-id-diff must accept it.
+    # Uses build_bare_run(), not build_scenario() -- see its docstring for why.
+    path_a, path_b = write_pair(
+        "replay_run_id_diff",
+        build_bare_run("run-A"),
+        build_bare_run("run-B"),
+    )
+
+    name = "SS7 replay_run_id_diff strict (different run_id, no flag -> violation)"
+    try:
+        audit.replay_compare(str(path_a), str(path_b))
+        ok, outcome, detail = False, "FAIL", "expected INV_7 violation but replay_compare accepted the pair"
+    except audit.AuditViolation as v:
+        if v.invariant == audit.INV_7:
+            ok, outcome, detail = True, "PASS", f"caught as [{v.invariant}]: {v.message}"
+        else:
+            ok, outcome, detail = False, "FAIL", f"expected {audit.INV_7}, got [{v.invariant}]: {v.message}"
+    results.append((name, ok, outcome, detail))
+
+    name = "SS7 replay_run_id_diff tolerant (--allow-run-id-diff -> OK)"
+    try:
+        n = audit.replay_compare(str(path_a), str(path_b), allow_run_id_diff=True)
+        ok, outcome, detail = True, "PASS", f"OK, {n} events match"
+    except audit.AuditViolation as v:
+        ok, outcome, detail = False, "FAIL", f"expected OK with allow_run_id_diff=True but got [{v.invariant}]: {v.message}"
+    results.append((name, ok, outcome, detail))
+
+    return results
+
+
 def main():
-    results = run()
+    results = run() + run_replay_tests()
 
     name_w = max(len(r[0]) for r in results)
     print(f"{'scenario':{name_w}}  {'result':6}  detail")
